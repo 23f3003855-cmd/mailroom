@@ -33,7 +33,7 @@ CHUNK = int(os.environ.get("CHUNK", "12"))
 PARALLEL = int(os.environ.get("PARALLEL", "6"))
 REQUEST_BUDGET = float(os.environ.get("REQUEST_BUDGET", "46"))  # seconds for model work
 MODELS = [m.strip() for m in os.environ.get(
-    "GEMINI_MODELS", os.environ.get("GEMINI_MODEL", "gemini-2.5-flash,gemini-2.0-flash")
+    "GEMINI_MODELS", os.environ.get("GEMINI_MODEL", "gemini-3.5-flash,gemini-3-flash-preview,gemini-3.1-flash-lite,gemini-2.5-flash,gemini-2.5-flash-lite")
 ).split(",") if m.strip()]
 
 
@@ -172,41 +172,96 @@ def render(d):
     return "\n".join(out)
 
 
-def call_gemini(text, deadline):
-    key = os.environ.get("GEMINI_API_KEY", "")
+_good_model = [None]  # remember the model that worked
+
+
+def _gen_configs(model):
+    base = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 8192}
+    cfgs = []
+    if "2.5-flash" in model:
+        cfgs.append(dict(base, thinkingConfig={"thinkingBudget": 0}))
+    elif model.startswith("gemini-3") and "lite" not in model:
+        cfgs.append(dict(base, thinkingConfig={"thinkingLevel": "low"}))
+    cfgs.append(base)
+    return cfgs
+
+
+def gemini_request(model, text, system, deadline, cfg):
+    key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not key:
         raise RuntimeError("no GEMINI_API_KEY")
+    body = {"contents": [{"role": "user", "parts": [{"text": text}]}], "generationConfig": cfg}
+    if system:
+        body["systemInstruction"] = {"parts": [{"text": system}]}
+    url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
+    req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={
+        "Content-Type": "application/json", "x-goog-api-key": key})
+    with urllib.request.urlopen(req, timeout=max(5, min(deadline - time.time(), 40))) as r:
+        data = json.loads(r.read())
+    parts = data["candidates"][0]["content"]["parts"]
+    return "".join(p.get("text", "") for p in parts)
+
+
+def call_gemini(text, deadline):
+    if not os.environ.get("GEMINI_API_KEY", "").strip():
+        raise RuntimeError("no GEMINI_API_KEY")
+    order = list(MODELS)
+    if _good_model[0] in order:
+        order.remove(_good_model[0])
+        order.insert(0, _good_model[0])
     last = None
-    for model in MODELS:
-        gen = {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": 8192}
-        if "2.5-flash" in model:
-            gen["thinkingConfig"] = {"thinkingBudget": 0}
-        body = json.dumps({
-            "systemInstruction": {"parts": [{"text": SYSTEM}]},
-            "contents": [{"role": "user", "parts": [{"text": text}]}],
-            "generationConfig": gen,
-        }).encode()
-        url = "https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent" % model
-        for attempt in range(3):
-            left = deadline - time.time()
-            if left < 5:
-                raise RuntimeError("out of time")
-            req = urllib.request.Request(url, data=body, headers={
-                "Content-Type": "application/json", "x-goog-api-key": key})
-            try:
-                with urllib.request.urlopen(req, timeout=min(left, 40)) as r:
-                    data = json.loads(r.read())
-                parts = data["candidates"][0]["content"]["parts"]
-                return "".join(p.get("text", "") for p in parts)
-            except urllib.error.HTTPError as e:
-                last = "http %s" % e.code
-                if e.code in (404, 400):
-                    break  # try next model
-                time.sleep(2 + attempt * 2)
-            except Exception as e:  # network / parse
-                last = type(e).__name__
-                time.sleep(1)
+    for model in order:
+        skip_model = False
+        for cfg in _gen_configs(model):
+            for attempt in range(3):
+                if deadline - time.time() < 5:
+                    raise RuntimeError("out of time (last: %s)" % last)
+                try:
+                    out = gemini_request(model, text, SYSTEM, deadline, cfg)
+                    _good_model[0] = model
+                    return out
+                except urllib.error.HTTPError as e:
+                    detail = ""
+                    try:
+                        detail = e.read().decode("utf-8", "replace")[:300]
+                    except Exception:
+                        pass
+                    last = "%s http %s" % (model, e.code)
+                    print("gemini error:", model, e.code, detail, flush=True)
+                    if e.code == 404:
+                        skip_model = True
+                        break
+                    if e.code == 400:
+                        break  # try next config for this model
+                    if e.code in (401, 403):
+                        raise RuntimeError("key rejected (%s)" % e.code)
+                    time.sleep(2 + attempt * 2)  # 429 / 5xx
+                except Exception as e:
+                    last = "%s %s" % (model, type(e).__name__)
+                    print("gemini error:", last, flush=True)
+                    time.sleep(1)
+            if skip_model:
+                break
     raise RuntimeError("model failed: %s" % last)
+
+
+def diagnose():
+    """Tiny test of every configured model; never reveals the key."""
+    res = {"hasKey": bool(os.environ.get("GEMINI_API_KEY", "").strip()), "models": {}}
+    for m in MODELS:
+        try:
+            out = gemini_request(m, 'Reply with the JSON {"ok": true}', None,
+                                 time.time() + 20, {"temperature": 0, "maxOutputTokens": 50})
+            res["models"][m] = "works: " + out.strip()[:40]
+        except urllib.error.HTTPError as e:
+            try:
+                d = e.read().decode("utf-8", "replace")[:200]
+            except Exception:
+                d = ""
+            res["models"][m] = "http %s %s" % (e.code, d)
+        except Exception as e:
+            res["models"][m] = type(e).__name__
+    return res
 
 
 def parse_model(text):
@@ -475,6 +530,9 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_GET(self):
+        if self.path.startswith("/_test"):
+            self._send(200, json.dumps(diagnose()))
+            return
         self._send(200, json.dumps({"status": "ok", "service": "safe-ai-mailroom"}))
 
     def do_POST(self):
