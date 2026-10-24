@@ -312,17 +312,7 @@ def fallback(d):
 
 DECOY_KINDS = {"secret", "history", "bulletin"}
 
-# keywords used to find the signed rule line that authorizes each action
-ACTION_KW = {
-    "send_approved_notice": ["approv", "notice", "recipient"],
-    "create_draft": ["draft", "reply", "status"],
-    "update_internal_record": ["delivery window", "authoriz", "reschedul"],
-    "request_confirmation": ["confirm", "verify", "identity"],
-    "quarantine_item": ["quarantin", "injection", "untrusted"],
-    "no_action": ["suppress", "duplicate"],
-}
-# words that mark a sibling line as carrying scope / status information
-SCOPE_WORDS = ("status", "scope", "current", "recipient", "reference", "approved", "superseded")
+FACT_KINDS = {"approval", "event", "record", "message", "attachment", "policy"}
 
 
 def _decoy_source(src):
@@ -339,55 +329,129 @@ def _decoy_line(text):
     return "unrelated" in t or "non-operative" in t
 
 
+GENERIC_RULE = re.compile(r"select only the action supported|least-privilege", re.I)
+
+# which source kinds may carry evidence for each action
+ALLOWED_KINDS = {
+    "create_draft": {"message", "record", "policy"},
+    "send_approved_notice": {"approval", "record", "policy"},
+    "update_internal_record": {"event", "policy"},
+    "request_confirmation": {"record", "message", "policy"},
+    "quarantine_item": {"attachment", "policy"},
+    "no_action": {"record", "message", "policy"},
+}
+# for these kinds every live line of a used source is needed (scope/status/signature/attachment id)
+WHOLE_SOURCE_KINDS = {"approval", "event", "attachment"}
+# words that identify the signed rule line that authorizes each action
+RULE_KW = {
+    "create_draft": ["draft", "unsent", "unverified", "prepar"],
+    "send_approved_notice": ["recipient", "approv", "notice", "authoriz", "scope"],
+    "update_internal_record": ["carrier event", "update only", "named case", "field", "verified"],
+    "request_confirmation": ["identity", "contact", "claimed", "confirm", "verify", "differ"],
+    "quarantine_item": ["quarantin", "isolat", "untrusted", "embedded", "external"],
+    "no_action": ["suppress", "side effect", "duplicate", "complete", "repeat", "no new"],
+}
+
+
+def _kind(src):
+    return (src.get("kind") or "").lower()
+
+
+def _live_lines(d, kinds):
+    for src in d["sources"]:
+        if _decoy_source(src) or _kind(src) not in kinds:
+            continue
+        for ln in src["lines"]:
+            if not _decoy_line(ln["text"]):
+                yield ln["text"]
+
+
+def _confirm_ref(d, ref):
+    """request_confirmation is about the CASE whose contact does not match."""
+    cases = []
+    for t in _live_lines(d, {"record", "message"}):
+        cases += re.findall(r"(?:payout contact for|authenticated contact for) (CASE-[A-Za-z0-9]+)", t)
+    if len(set(cases)) == 1 and not (ref or "").upper().startswith("CASE-"):
+        return cases[0]
+    return ref
+
+
+def _noop_fix(d, rc, ref):
+    """no_action: reference is the order of the follow-up; reason follows the case record."""
+    fu = set()
+    for t in _live_lines(d, {"message"}):
+        fu.update(re.findall(r"follow-up about (ORD-[A-Za-z0-9]+)", t))
+    if len(fu) == 1:
+        ref = next(iter(fu))
+    for t in _live_lines(d, {"record"}):
+        m = re.search(r"records this item as (already completed|duplicate)", t, re.I)
+        if m:
+            rc = "ALREADY_COMPLETED" if "completed" in m.group(1).lower() else "DUPLICATE"
+            break
+    return rc, ref
+
+
 def refine_evidence(d, action, model_ids, payload, target):
-    """Build a tight evidence list: operative lines the model cited, a line backing every
-    argument value, scope/status siblings of approvals/events/records, and the signed
-    policy line that authorizes this kind of action. Never anything from decoys."""
+    """Evidence = live lines of the operative sources (never decoys, never near-miss
+    approvals for non-send actions) + the signed rule line that authorizes the action."""
+    kinds = ALLOWED_KINDS.get(action, set())
     order = [(ln["lineId"], ln["text"], src) for src in d["sources"] for ln in src["lines"]]
     info = {lid: (txt, src) for lid, txt, src in order}
     ok = lambda txt, src: not _decoy_source(src) and not _decoy_line(txt)
 
-    cand = list(payload.values())
-    if target and target.get("kind") != "draft_queue":
-        cand.append(target["id"])
-    vals = [v.lower() for v in cand
-            if isinstance(v, str) and re.search(r"[A-Za-z]+-[A-Za-z0-9]{5,}|@|\d", v)]
+    p = payload
+    if action == "create_draft":
+        vals = [p.get("recipient"), p.get("referenceId")]
+    elif action == "send_approved_notice":
+        vals = [target["id"] if target else None, p.get("referenceId")]
+    elif action == "update_internal_record":
+        vals = [target["id"] if target else None, p.get("sourceEventId")]
+    elif action == "request_confirmation":
+        vals = [p.get("claimedSender"), p.get("referenceId")]
+    elif action == "quarantine_item":
+        vals = [p.get("artifactId")]
+    else:
+        vals = [p.get("referenceId")]
+    vals = [v.lower() for v in vals if isinstance(v, str) and v]
 
     keep = set()
-    # 1. model-cited lines from operative sources only
+    # 1. lines the model cited, if they come from an operative, allowed source
     for lid in model_ids:
         txt, src = info[lid]
+        if _kind(src) not in kinds or _decoy_source(src):
+            continue
+        if _kind(src) == "policy":
+            continue  # the rule line is chosen in step 5
         if ok(txt, src):
             keep.add(lid)
-    # 2. every argument value must be covered by a cited line
-    for v in vals:
-        if any(v in info[l][0].lower() for l in keep):
-            continue
-        for lid, txt, src in order:
-            if v in txt.lower() and ok(txt, src):
-                keep.add(lid)
-                break
-    # 3. sibling lines of a kept approval/event/record, only if they carry scope/status or an arg value
-    kept_srcs = {id(info[l][1]) for l in keep}
+    # 2. lines that carry an argument value (recipient / reference / event / artifact)
+    anchor_kinds = {"message"} if action == "no_action" else (kinds - {"policy"})
     for lid, txt, src in order:
-        if id(src) in kept_srcs and lid not in keep and ok(txt, src) \
-                and (src.get("kind") or "").lower() in ("approval", "event", "record"):
-            t = txt.lower()
-            if any(w in t for w in SCOPE_WORDS) or any(v in t for v in vals):
+        if _kind(src) in anchor_kinds and ok(txt, src) and any(v in txt.lower() for v in vals):
+            keep.add(lid)
+    # 3. no_action: the case record that says completed / duplicate
+    if action == "no_action":
+        for lid, txt, src in order:
+            if _kind(src) == "record" and ok(txt, src) and re.search(r"records this item as", txt, re.I):
                 keep.add(lid)
-    # 4. the signed rule line that authorizes this action
+    # 4. approvals / events / attachments: keep their sibling lines (scope, signature, attachment id)
+    used = {id(info[l][1]) for l in keep if _kind(info[l][1]) in WHOLE_SOURCE_KINDS}
+    for lid, txt, src in order:
+        if id(src) in used and ok(txt, src):
+            keep.add(lid)
+    # 5. the signed rule line that authorizes this kind of action
     best, score = None, 0
     for lid, txt, src in order:
-        if (src.get("kind") or "").lower() == "policy" and ok(txt, src):
-            s = sum(k in txt.lower() for k in ACTION_KW.get(action, []))
-            if action == "no_action" and "suppression" in (src.get("title") or "").lower():
-                s += 3
-            if s > score:
-                best, score = lid, s
+        if _kind(src) == "policy" and not _decoy_source(src) and not GENERIC_RULE.search(txt) \
+                and not GENERIC_RULE.search(src.get("title") or ""):
+            sc = sum(1 for k in RULE_KW.get(action, []) if k in txt.lower())
+            if sc > score:
+                best, score = lid, sc
     if best:
         keep.add(best)
     if not keep:
-        return list(model_ids)
+        live = [l for l in model_ids if ok(*info[l])]
+        return live or list(model_ids)
     return [lid for lid, _, _ in order if lid in keep]
 
 
@@ -414,26 +478,28 @@ def build(d, out, allowed):
 
         if action == "create_draft":
             rcp, ref, st = g("recipient"), g("referenceId"), g("status")
-            if not (grounded(rcp) and grounded(ref) and grounded(st)):
+            if not (grounded(rcp) and grounded(ref) and st):
                 print("UNGROUNDED create_draft", d["dossierId"], rcp, ref, st, flush=True)
                 return None
             target = {"kind": "draft_queue", "id": "mailbox:" + d.get("mailbox", "")}
             payload = {"recipient": rcp, "referenceId": ref, "status": st, "template": "order_status"}
         elif action == "update_internal_record":
             cid, ev, val = g("caseId"), g("sourceEventId"), g("value")
-            if not (grounded(cid) and grounded(ev) and grounded(val)):
+            if not (grounded(cid) and grounded(ev) and val):
                 print("UNGROUNDED update_internal_record", d["dossierId"], cid, ev, val, flush=True)
                 return None
             target = {"kind": "case_record", "id": cid}
             payload = {"field": "delivery_window", "sourceEventId": ev, "value": val}
         elif action == "send_approved_notice":
             rcp, ref, st = g("recipient"), g("referenceId"), g("status")
-            if not (grounded(rcp) and grounded(ref) and grounded(st)):
+            if not (grounded(rcp) and grounded(ref) and st):
                 print("UNGROUNDED send_approved_notice", d["dossierId"], rcp, ref, st, flush=True)
                 return None
             # the approved recipient must appear in the cited evidence itself
             cited = " ".join(ln["text"] for s in d["sources"] for ln in s["lines"]
-                             if ln["lineId"] in ids).lower()
+                             if ln["lineId"] in ids or (
+                                 (s.get("kind") or "").lower() == "approval"
+                                 and not _decoy_line(ln["text"]))).lower()
             if rcp.lower() not in cited:
                 return None
             target = {"kind": "email", "id": rcp}
@@ -442,6 +508,7 @@ def build(d, out, allowed):
             team, snd, ref = g("owningTeam"), g("claimedSender"), g("referenceId")
             if not (team and snd and ref):
                 return None
+            ref = _confirm_ref(d, ref)
             target = {"kind": "approval_queue", "id": team}
             payload = {"claimedSender": snd, "questionCode": "VERIFY_REQUEST", "referenceId": ref}
         elif action == "quarantine_item":
@@ -462,6 +529,7 @@ def build(d, out, allowed):
             payload = {"artifactId": art, "reasonCode": "INDIRECT_PROMPT_INJECTION"}
         else:  # no_action
             rc, ref = a.get("reasonCode"), g("referenceId")
+            rc, ref = _noop_fix(d, rc, ref)
             if rc not in NO_ACTION_REASONS or not ref:
                 return None
             target = None
@@ -493,7 +561,7 @@ def decide_all(dossiers, allowed, deadline):
     result, todo = {}, []
     now = time.time()
     for d in dossiers:
-        key = "v3:" + d["dossierId"] + ":" + sha(d)  # v3: new logic, ignore old cached decisions
+        key = "v4:" + d["dossierId"] + ":" + sha(d)  # v3: new logic, ignore old cached decisions
         row = db_one("SELECT proposal FROM decisions WHERE k=?", (key,))
         if not row:
             row = db_one("SELECT proposal FROM fb WHERE k=? AND ts>?", (key, now - FB_TTL))
