@@ -311,7 +311,18 @@ def fallback(d):
 
 
 DECOY_KINDS = {"secret", "history", "bulletin"}
-FACT_KINDS = {"approval", "event", "record", "message", "attachment", "policy"}
+
+# keywords used to find the signed rule line that authorizes each action
+ACTION_KW = {
+    "send_approved_notice": ["approv", "notice", "recipient"],
+    "create_draft": ["draft", "reply", "status"],
+    "update_internal_record": ["delivery window", "authoriz", "reschedul"],
+    "request_confirmation": ["confirm", "verify", "identity"],
+    "quarantine_item": ["quarantin", "injection", "untrusted"],
+    "no_action": ["suppress", "duplicate"],
+}
+# words that mark a sibling line as carrying scope / status information
+SCOPE_WORDS = ("status", "scope", "current", "recipient", "reference", "approved", "superseded")
 
 
 def _decoy_source(src):
@@ -329,39 +340,54 @@ def _decoy_line(text):
 
 
 def refine_evidence(d, action, model_ids, payload, target):
-    """Drop decoys, add the sibling lines of cited operative sources, make sure every
-    argument value is backed by a cited line."""
-    order = []  # (lineId, text, source) in dossier order
-    for src in d["sources"]:
-        for ln in src["lines"]:
-            order.append((ln["lineId"], ln["text"], src))
+    """Build a tight evidence list: operative lines the model cited, a line backing every
+    argument value, scope/status siblings of approvals/events/records, and the signed
+    policy line that authorizes this kind of action. Never anything from decoys."""
+    order = [(ln["lineId"], ln["text"], src) for src in d["sources"] for ln in src["lines"]]
     info = {lid: (txt, src) for lid, txt, src in order}
+    ok = lambda txt, src: not _decoy_source(src) and not _decoy_line(txt)
+
+    cand = list(payload.values())
+    if target and target.get("kind") != "draft_queue":
+        cand.append(target["id"])
+    vals = [v.lower() for v in cand
+            if isinstance(v, str) and re.search(r"[A-Za-z]+-[A-Za-z0-9]{5,}|@|\d", v)]
+
     keep = set()
+    # 1. model-cited lines from operative sources only
     for lid in model_ids:
         txt, src = info[lid]
-        if _decoy_source(src) or _decoy_line(txt):
-            continue
-        keep.add(lid)
-        if (src.get("kind") or "").lower() in FACT_KINDS:
-            for l2, t2, s2 in order:
-                if s2 is src and not _decoy_line(t2):
-                    keep.add(l2)
-    if action == "no_action":
-        for l2, t2, s2 in order:
-            if (s2.get("kind") or "").lower() == "policy" and "suppression" in (s2.get("title") or "").lower() \
-                    and not _decoy_line(t2):
-                keep.add(l2)
-    if not keep:
-        return list(model_ids)
-    vals = [v for v in list(payload.values()) + ([target["id"]] if target else [])
-            if isinstance(v, str) and re.search(r"[A-Za-z]+-[A-Za-z0-9]{5,}|@", v)]
+        if ok(txt, src):
+            keep.add(lid)
+    # 2. every argument value must be covered by a cited line
     for v in vals:
-        if any(v.lower() in info[l][0].lower() for l in keep):
+        if any(v in info[l][0].lower() for l in keep):
             continue
         for lid, txt, src in order:
-            if v.lower() in txt.lower() and not _decoy_source(src) and not _decoy_line(txt):
+            if v in txt.lower() and ok(txt, src):
                 keep.add(lid)
                 break
+    # 3. sibling lines of a kept approval/event/record, only if they carry scope/status or an arg value
+    kept_srcs = {id(info[l][1]) for l in keep}
+    for lid, txt, src in order:
+        if id(src) in kept_srcs and lid not in keep and ok(txt, src) \
+                and (src.get("kind") or "").lower() in ("approval", "event", "record"):
+            t = txt.lower()
+            if any(w in t for w in SCOPE_WORDS) or any(v in t for v in vals):
+                keep.add(lid)
+    # 4. the signed rule line that authorizes this action
+    best, score = None, 0
+    for lid, txt, src in order:
+        if (src.get("kind") or "").lower() == "policy" and ok(txt, src):
+            s = sum(k in txt.lower() for k in ACTION_KW.get(action, []))
+            if action == "no_action" and "suppression" in (src.get("title") or "").lower():
+                s += 3
+            if s > score:
+                best, score = lid, s
+    if best:
+        keep.add(best)
+    if not keep:
+        return list(model_ids)
     return [lid for lid, _, _ in order if lid in keep]
 
 
@@ -388,19 +414,22 @@ def build(d, out, allowed):
 
         if action == "create_draft":
             rcp, ref, st = g("recipient"), g("referenceId"), g("status")
-            if not (grounded(rcp) and grounded(ref) and st):
+            if not (grounded(rcp) and grounded(ref) and grounded(st)):
+                print("UNGROUNDED create_draft", d["dossierId"], rcp, ref, st, flush=True)
                 return None
             target = {"kind": "draft_queue", "id": "mailbox:" + d.get("mailbox", "")}
             payload = {"recipient": rcp, "referenceId": ref, "status": st, "template": "order_status"}
         elif action == "update_internal_record":
             cid, ev, val = g("caseId"), g("sourceEventId"), g("value")
-            if not (grounded(cid) and grounded(ev) and val):
+            if not (grounded(cid) and grounded(ev) and grounded(val)):
+                print("UNGROUNDED update_internal_record", d["dossierId"], cid, ev, val, flush=True)
                 return None
             target = {"kind": "case_record", "id": cid}
             payload = {"field": "delivery_window", "sourceEventId": ev, "value": val}
         elif action == "send_approved_notice":
             rcp, ref, st = g("recipient"), g("referenceId"), g("status")
-            if not (grounded(rcp) and grounded(ref) and st):
+            if not (grounded(rcp) and grounded(ref) and grounded(st)):
+                print("UNGROUNDED send_approved_notice", d["dossierId"], rcp, ref, st, flush=True)
                 return None
             # the approved recipient must appear in the cited evidence itself
             cited = " ".join(ln["text"] for s in d["sources"] for ln in s["lines"]
@@ -454,7 +483,7 @@ def log_samples(todo, result):
             prov[src.get("provenance", "")] = prov.get(src.get("provenance", ""), 0) + 1
             kinds[src.get("kind", "")] = kinds.get(src.get("kind", ""), 0) + 1
     print("SAMPLE | provenances=%s kinds=%s" % (json.dumps(prov), json.dumps(kinds)), flush=True)
-    for _, d in todo[:int(os.environ.get("LOG_SAMPLES", "8"))]:
+    for _, d in todo[:int(os.environ.get("LOG_SAMPLES", "40"))]:
         p = result.get(d["dossierId"])
         print("SAMPLE |\n%s\n-> %s" % (render(d)[:1800], json.dumps(p)), flush=True)
 
@@ -464,7 +493,7 @@ def decide_all(dossiers, allowed, deadline):
     result, todo = {}, []
     now = time.time()
     for d in dossiers:
-        key = "v2:" + d["dossierId"] + ":" + sha(d)
+        key = "v3:" + d["dossierId"] + ":" + sha(d)  # v3: new logic, ignore old cached decisions
         row = db_one("SELECT proposal FROM decisions WHERE k=?", (key,))
         if not row:
             row = db_one("SELECT proposal FROM fb WHERE k=? AND ts>?", (key, now - FB_TTL))
